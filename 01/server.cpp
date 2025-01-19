@@ -1,6 +1,5 @@
 #include <assert.h>
 #include <cerrno>
-#include <map>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -16,7 +15,10 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <vector>
+#include "hashtable.h"
 
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member)))
 
 
 static void msg(const char *msg) {
@@ -86,8 +88,8 @@ static Conn *handle_accept(int fd) {
     }
     uint32_t ip = client_addr.sin_addr.s_addr;
     printf("new client from %u. %u. %u. %u. %u. \n",
-    ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
-    ntohs(client_addr.sin_port)
+        ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
+        ntohs(client_addr.sin_port)
     );
 
     fd_set_nb(connfd);
@@ -97,6 +99,8 @@ static Conn *handle_accept(int fd) {
     conn->want_read = true;
     return conn;
 }
+
+const size_t k_max_args = 200 * 1000;
 
 static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out){
     if(cur + 4 > end) {
@@ -120,7 +124,8 @@ static bool read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::str
 // | nstr | len | str1 | len | str2 | ... | len | strn |
 // +------+-----+------+-----+------+-----+-----+------+
 
-static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
+static int32_t 
+parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
     const uint8_t *end = data + size;
     uint32_t nstr = 0;
     if (!read_u32(data, end, nstr)){
@@ -156,21 +161,77 @@ struct Response {
     std::vector<uint8_t> data;
 };
 
-static std::map<std::string, std::string> g_data;
+static struct {
+    HMap db;
+} g_data;
+
+struct Entry {
+    struct HNode node;
+    std::string key;
+    std::string val;
+};
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+static uint64_t str_hash(const uint8_t *data, size_t len){
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++){
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(std::vector<std::string> &cmd, Response &out){
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if(!node){
+        out.status = RES_NX;
+        return;
+    }
+    const std::string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &) {
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if(node){
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    } else {
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+}
+
+static void do_del(std::vector<std::string> &cmd, Response &){
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if(node) {
+        delete container_of(node, Entry, node);
+    }
+}
 
 static void do_request(std::vector<std::string> &cmd, Response &out){
     if(cmd.size() == 2 && cmd[0] == "get"){
-        auto it = g_data.find(cmd[1]);
-        if(it == g_data.end()){
-            out.status = RES_NX;
-            return;
-        }
-        const std::string &val = it->second;
-        out.data.assign(val.begin(), val.end());
+        return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set"){
-        g_data[cmd[1]].swap(cmd[2]);
+        return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del"){
-        g_data.erase(cmd[1]);
+        return do_del(cmd, out);
     } else {
         out.status = RES_ERR;
     }
