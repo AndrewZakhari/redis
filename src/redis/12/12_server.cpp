@@ -22,8 +22,7 @@
 #include "hashtable.h"
 #include "zset.h"
 #include "list.h"
-#include "heap.h"
-#include "thread_pool.h"
+
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -95,8 +94,6 @@ static struct {
     std::vector<Conn *> fd2conn;
     // timers for idle connections
     DList idle_list;
-    std::vector<HeapItem> heap;
-    TheadPool thread_pool;
 } g_data;
 
 // application callback when the listening socket is ready
@@ -278,8 +275,6 @@ struct Entry {
     // one of the following
     std::string str;
     ZSet zset;
-    // TTL
-    size_t heap_idx = -1;
 };
 
 static Entry *entry_new(uint32_t type) {
@@ -288,29 +283,11 @@ static Entry *entry_new(uint32_t type) {
     return ent;
 }
 
-static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
-
-static void entry_del_sync(Entry *ent){
-    if(ent->type == T_ZSET){
+static void entry_del(Entry *ent) {
+    if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
     }
     delete ent;
-}
-
-static void entry_del_func(void *arg){
-    entry_del_sync((Entry *)arg);
-}
-
-static void entry_del(Entry *ent) {
-    entry_set_ttl(ent, -1);
-
-    size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap): 0;
-    const size_t k_large_container_size = 1000;
-    if(set_size > k_large_container_size){
-        thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
-    }else{
-        entry_del_sync(ent);
-    }
 }
 
 struct LookupKey {
@@ -381,78 +358,6 @@ static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     return out_int(out, node ? 1 : 0);
 }
 
-static void heap_delete(std::vector<HeapItem> &a, size_t pos){
-    a[pos] = a.back();
-    a.pop_back();
-    if(pos < a.size()){
-        heap_update(a.data(), pos, a.size());
-    }
-}
-
-static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t){
-    if(pos < a.size()){
-        a[pos] = t;
-    }else{
-        pos = a.size();
-        a.push_back(t);
-    }
-    heap_update(a.data(), pos, a.size());
-}
-static void entry_set_ttl(Entry *ent, int64_t ttl_ms){
-    if(ttl_ms < 0 && ent->heap_idx != (size_t)-1){
-        heap_delete(g_data.heap, ent->heap_idx);
-        ent->heap_idx = -1;
-    }else if(ttl_ms >= 0){
-        uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
-        HeapItem item = {expire_at, &ent->heap_idx};
-        heap_upset(g_data.heap, ent->heap_idx, item);
-    }
-}
-
-static bool str2int(const std::string &s, int64_t &out){
-    char *endp = NULL;
-    out = strtoll(s.c_str(), &endp, 10);
-    return endp == s.c_str() + s.size();
-}
-
-static void do_expire(std::vector<std::string> &cmd, Buffer &out){
-    int64_t ttl_ms =0;
-    if(!str2int(cmd[2], ttl_ms)){
-        return out_err(out, ERR_BAD_ARG, "expect int64");
-    }
-
-    LookupKey key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if(node) {
-        Entry *ent = container_of(node, Entry, node);
-        entry_set_ttl(ent, ttl_ms);
-    }
-    return out_int(out, node ? 1 : 0);
-}
-
-static void do_ttl(std::vector<std::string> &cmd, Buffer &out){
-    LookupKey key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if(!node){
-        return out_int(out, -2);
-    }
-
-    Entry *ent = container_of(node, Entry, node);
-    if(ent->heap_idx == (size_t)-1){
-        return out_int(out, -1);
-    }
-
-    uint64_t expire_at = g_data.heap(ent->heap_idx).val;
-    uint64_t now_ms = get_monotonic_msec();
-    return out_int(out, expire_at > now_ms ? (expire_at - now_ms): 0);
-}
-
 static bool cb_keys(HNode *node, void *arg) {
     Buffer &out = *(Buffer *)arg;
     const std::string &key = container_of(node, Entry, node)->key;
@@ -469,6 +374,12 @@ static bool str2dbl(const std::string &s, double &out) {
     char *endp = NULL;
     out = strtod(s.c_str(), &endp);
     return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
 }
 
 // zadd zset score name
@@ -589,10 +500,6 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
-    }else if(cmd.size() == 3 && cmd[0] == "pexpire"){
-        return do_expire(cmd, out);
-    }else if(cmd.size() == 2 && cmd[0] == "pttl"){
-        return do_ttl(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "keys") {
         return do_keys(cmd, out);
     } else if (cmd.size() == 4 && cmd[0] == "zadd") {
@@ -731,26 +638,17 @@ static void handle_read(Conn *conn) {
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
 static int32_t next_timer_ms() {
+    if (dlist_empty(&g_data.idle_list)) {
+        return -1;  // no timers, no timeouts
+    }
+
     uint64_t now_ms = get_monotonic_msec();
+    Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
     uint64_t next_ms = conn->last_active_ms + k_idle_timeout_ms;
-    if (!dlist_empty(&g_data.idle_list)) {
-       Conn *conn = container_of(g_data.idle_list.next, Conn, idle_node);
-       next_ms = conn->last_active_ms +k_idle_timeout_ms; 
-    }
-    if(!g_data.heap.empty() && g_data.heap[0].val < next_ms){
-        next_ms = g_data.heap[0].val;
-    }
-    if(next_ms == (uint64_t)-1){
-        return -1;
-    }
     if (next_ms <= now_ms) {
         return 0;   // missed?
     }
     return (int32_t)(next_ms - now_ms);
-}
-
-static bool hnode_same(HNode *node, HNode *key){
-    return node == key;
 }
 
 static void process_timers() {
@@ -765,25 +663,12 @@ static void process_timers() {
         fprintf(stderr, "removing idle connection: %d\n", conn->fd);
         conn_destroy(conn);
     }
-    // TTL timers using heap
-    const size_t k_max_works = 2000;
-    size_t nworks = 0;
-    const std::vector<HeapItem> &heap = g_data.heap;
-    while(!heap.empty() && heap[0].val < now_ms){
-        Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
-        HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
-        assert(node == &ent->node);
-        entry_del(ent);
-        if(nworks++ >= k_max_works){
-            break;
-        }
-    }
 }
 
 int main() {
     // initialization
     dlist_init(&g_data.idle_list);
-    thread_pool_init(&g_data.thread_pool, 4);
+
     // the listening socket
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {

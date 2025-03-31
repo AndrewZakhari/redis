@@ -114,27 +114,12 @@ HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
     return NULL;
 }
 
-size_t hm_size(HMap *hmap) {
-    return hmap->newer.size + hmap->older.size;
-}
-
 void hm_clear(HMap *hmap) {
     free(hmap->newer.tab);
     free(hmap->older.tab);
     *hmap = HMap{};
 }
 
-static bool h_foreach(HTab *htab, bool(*f)(HNode *, void *) , void *arg){
-    for(size_t i = 0; htab->mask != 0 && i <= htab->mask; i++){
-        for(HNode *node = htab->tab[i]; node!= NULL; node = node->next){
-            if(!f(node, arg)){
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg){
-    h_foreach(&hmap->newer, f, arg) && h_foreach(&hmap->older, f, arg);
+size_t hm_size(HMap *hmap) {
+    return hmap->newer.size + hmap->older.size;
 }
